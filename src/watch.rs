@@ -114,9 +114,8 @@ pub enum ClipboardEvent<'a> {
 /// loop. The first call reports the current selection state; subsequent calls block until the
 /// selection changes again.
 ///
-/// The caller owns the loop, so you can `break` and `?`-propagate errors. To stop a watcher that
-/// is blocked in [`Watcher::next_event`] on another thread, obtain a [`CancelHandle`] from
-/// [`Watcher::cancel_handle`] and call [`CancelHandle::cancel`].
+/// Seats are resolved when the watcher starts, so passing [`Seat::Unspecified`] will use the
+/// first seat found on construction rather than re-enumerating seats as offers come in.
 pub struct Watcher {
     queue: EventQueue<State>,
     state: State,

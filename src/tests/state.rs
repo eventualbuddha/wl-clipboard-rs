@@ -83,7 +83,7 @@ pub struct State {
     #[proptest(value = "None")]
     pub selection_updated_sender: Option<Sender<Option<Vec<String>>>>,
     pub set_nonblock_on_write_fd: bool,
-    /// All data devices per seat, for propagating selection changes.
+    // All data devices per seat, for propagating selection changes.
     #[proptest(value = "HashMap::new()")]
     pub devices: HashMap<String, Vec<ZwlrDataControlDeviceV1>>,
 }
