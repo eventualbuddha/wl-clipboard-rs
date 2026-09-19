@@ -1,6 +1,6 @@
 //! Watching the clipboard for selection changes with a [`Watcher`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::io;
 use std::os::fd::AsFd;
@@ -20,23 +20,60 @@ use crate::paste::{ClipboardType, Error, Seat};
 
 struct State {
     common: common::State,
-    // Maps each in-flight offer to its advertised MIME types, populated as Offer events arrive
-    // before the corresponding Selection event links the offer to a seat.
+    // Maps each newly introduced offer to its advertised MIME types, populated as Offer events
+    // arrive. The Selection event that follows moves the entry into its `SelectionEvent`.
     offers: HashMap<data_control::Offer, Vec<String>>,
-    selection_events: Vec<SelectionEvent>,
+    selection_events: VecDeque<SelectionEvent>,
 }
 
 impl State {
     fn got_primary_selection(&self) -> bool {
-        self.selection_events.iter().any(|event| event.is_primary)
+        self.selection_events
+            .iter()
+            .any(|event| event.clipboard == ClipboardType::Primary)
+    }
+
+    fn push_selection_event(
+        &mut self,
+        clipboard: ClipboardType,
+        seat: &WlSeat,
+        offer: Option<data_control::Offer>,
+    ) {
+        let offer = offer.map(|offer| {
+            // Each offer belongs to exactly one selection event, so take its MIME types here.
+            let mime_types = self.offers.remove(&offer).unwrap_or_default();
+            SelectionOffer {
+                offer: OwnedOffer(offer),
+                mime_types,
+            }
+        });
+        self.selection_events.push_back(SelectionEvent {
+            clipboard,
+            seat: seat.clone(),
+            offer,
+        });
     }
 }
 
 /// Pending selection event to report from the watch loop.
 struct SelectionEvent {
-    is_primary: bool,
+    clipboard: ClipboardType,
     seat: WlSeat,
-    offer: Option<data_control::Offer>,
+    offer: Option<SelectionOffer>,
+}
+
+struct SelectionOffer {
+    offer: OwnedOffer,
+    mime_types: Vec<String>,
+}
+
+// Not `Clone`: dropping it destroys the underlying Wayland object.
+struct OwnedOffer(data_control::Offer);
+
+impl Drop for OwnedOffer {
+    fn drop(&mut self) {
+        self.0.destroy();
+    }
 }
 
 delegate_dispatch!(State: [WlSeat: ()] => common::State);
@@ -68,12 +105,11 @@ impl_dispatch_device!(State, WlSeat, |state: &mut Self, event, seat: &WlSeat| {
             state.offers.insert(offer, Vec::new());
         }
         Event::Selection { id } => {
-            let offer = id.map(data_control::Offer::from);
-            state.selection_events.push(SelectionEvent {
-                is_primary: false,
-                seat: seat.clone(),
-                offer,
-            });
+            state.push_selection_event(
+                ClipboardType::Regular,
+                seat,
+                id.map(data_control::Offer::from),
+            );
         }
         Event::Finished => {
             // Destroy the device stored in the seat as it's no longer valid.
@@ -81,12 +117,11 @@ impl_dispatch_device!(State, WlSeat, |state: &mut Self, event, seat: &WlSeat| {
             seat_data.set_device(None);
         }
         Event::PrimarySelection { id } => {
-            let offer = id.map(data_control::Offer::from);
-            state.selection_events.push(SelectionEvent {
-                is_primary: true,
-                seat: seat.clone(),
-                offer,
-            });
+            state.push_selection_event(
+                ClipboardType::Primary,
+                seat,
+                id.map(data_control::Offer::from),
+            );
         }
         _ => (),
     }
@@ -137,7 +172,7 @@ pub enum ClipboardEvent<'a> {
 pub struct Watcher {
     queue: EventQueue<State>,
     state: State,
-    primary: bool,
+    clipboard: ClipboardType,
     // The single seat whose selections we report, resolved at construction.
     watched: WlSeat,
     // Cancellation pipe: the read end is polled in `wait`; the write end is handed out as a
@@ -161,8 +196,7 @@ impl Watcher {
         seat: Seat<'_>,
         socket_name: Option<OsString>,
     ) -> Result<Self, Error> {
-        let primary = clipboard == ClipboardType::Primary;
-        let (mut queue, mut common) = initialize(primary, socket_name)?;
+        let (mut queue, mut common) = initialize(clipboard == ClipboardType::Primary, socket_name)?;
 
         if common.seats.is_empty() {
             return Err(Error::NoSeats);
@@ -179,14 +213,14 @@ impl Watcher {
         let mut state = State {
             common,
             offers: HashMap::new(),
-            selection_events: Vec::new(),
+            selection_events: VecDeque::new(),
         };
 
         queue
             .roundtrip(&mut state)
             .map_err(Error::WaylandCommunication)?;
 
-        if primary && !state.got_primary_selection() {
+        if clipboard == ClipboardType::Primary && !state.got_primary_selection() {
             return Err(Error::PrimarySelectionUnsupported);
         }
 
@@ -207,7 +241,7 @@ impl Watcher {
         Ok(Watcher {
             queue,
             state,
-            primary,
+            clipboard,
             watched,
             cancel_read,
             cancel_write: Arc::new(cancel_write),
@@ -236,37 +270,24 @@ impl Watcher {
         Ok(Some(self.take_front_event()))
     }
 
-    // Discards leading events for other clipboards/seats (destroying their offers), returning
-    // whether a matching event is now at the front of the queue.
+    // Discards leading events for other clipboards/seats, returning whether a matching event is now
+    // at the front of the queue.
     fn front_matches(&mut self) -> bool {
-        loop {
-            let Some(event) = self.state.selection_events.first() else {
-                return false;
-            };
-            if event.is_primary == self.primary && event.seat == self.watched {
+        while let Some(event) = self.state.selection_events.front() {
+            if event.clipboard == self.clipboard && event.seat == self.watched {
                 return true;
             }
-            let event = self.state.selection_events.remove(0);
-            if let Some(offer) = event.offer {
-                // Offers belong to one selection event. We're removing `event`, so it's safe and
-                // necessary to remove MIME type entries to avoid a leak.
-                self.state.offers.remove(&offer);
-                offer.destroy();
-            }
+            self.state.selection_events.pop_front();
         }
+        false
     }
 
     // Removes the front event, returning its kind and an [`Offer`] to receive from. Only call when
     // `front_matches` returned `true`.
     fn take_front_event<'a>(&'a mut self) -> ClipboardEvent<'a> {
-        let event = self.state.selection_events.remove(0);
-        let mime_types = event
-            .offer
-            .as_ref()
-            .and_then(|o| self.state.offers.remove(o))
-            .unwrap_or_default();
+        let event = self.state.selection_events.pop_front().unwrap();
         match event.offer {
-            Some(offer) => ClipboardEvent::Changed {
+            Some(SelectionOffer { offer, mime_types }) => ClipboardEvent::Changed {
                 mime_types,
                 offer: Offer {
                     watcher: self,
@@ -321,13 +342,7 @@ impl Watcher {
 /// The data offer accompanying a [`ClipboardEvent`], borrowed from its [`Watcher`].
 pub struct Offer<'a> {
     watcher: &'a mut Watcher,
-    offer: data_control::Offer,
-}
-
-impl Drop for Offer<'_> {
-    fn drop(&mut self) {
-        self.offer.destroy();
-    }
+    offer: OwnedOffer,
 }
 
 impl Offer<'_> {
@@ -336,7 +351,7 @@ impl Offer<'_> {
     /// Returns `Err(Error::ClipboardEmpty)` on a [`ClipboardEvent::Cleared`] event.
     pub fn receive(&mut self, mime_type: &str) -> Result<PipeReader, Error> {
         let (read, write) = pipe().map_err(Error::PipeCreation)?;
-        self.offer.receive(mime_type.to_string(), write.as_fd());
+        self.offer.0.receive(mime_type.to_string(), write.as_fd());
         drop(write);
         self.watcher
             .queue
