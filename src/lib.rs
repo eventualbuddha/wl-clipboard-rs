@@ -68,19 +68,19 @@
 //! # extern crate wl_clipboard_rs;
 //! # fn foo() -> Result<(), Box<dyn std::error::Error>> {
 //! use std::io::Read;
-//! use wl_clipboard_rs::paste::{ClipboardType, Seat};
-//! use wl_clipboard_rs::watch::{ClipboardEvent, Watcher};
+//! use wl_clipboard_rs::paste::Seat;
+//! use wl_clipboard_rs::watch::{ClipboardEvent, ClipboardType, Watcher};
 //!
 //! let mut watcher = Watcher::new(ClipboardType::Regular, Seat::Unspecified)?;
 //! while let Some(event) = watcher.next_event()? {
 //!     match event {
-//!         ClipboardEvent::Changed { mime_types, mut offer } if mime_types.iter().any(|m| m == "text/plain") => {
+//!         ClipboardEvent::Changed { mime_types, mut offer, .. } if mime_types.iter().any(|m| m == "text/plain") => {
 //!             let mut contents = String::new();
 //!             offer.receive("text/plain")?.read_to_string(&mut contents)?;
 //!             println!("Clipboard changed: {contents}");
 //!         }
 //!         ClipboardEvent::Changed { .. } => {}
-//!         ClipboardEvent::Cleared => println!("Clipboard cleared"),
+//!         ClipboardEvent::Cleared { .. } => println!("Clipboard cleared"),
 //!     }
 //! }
 //! # Ok(())

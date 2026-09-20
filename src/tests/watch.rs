@@ -10,7 +10,7 @@ use crate::copy::{self, MimeSource, Options, ServeRequests, Source};
 use crate::paste::*;
 use crate::tests::state::*;
 use crate::tests::TestServer;
-use crate::watch::{ClipboardEvent, Watcher};
+use crate::watch::{ClipboardEvent, ClipboardType, Watcher};
 
 #[test]
 fn watch_initial_changed() {
@@ -67,7 +67,7 @@ fn watch_initial_cleared() {
         Watcher::with_socket(ClipboardType::Regular, Seat::Unspecified, Some(socket_name)).unwrap();
     let event = watcher.next_event().unwrap().unwrap();
 
-    assert!(matches!(event, ClipboardEvent::Cleared));
+    assert!(matches!(event, ClipboardEvent::Cleared { .. }));
 }
 
 #[test]
@@ -136,7 +136,7 @@ fn watch_selection_change() {
 
     // First event should be Cleared (empty initial clipboard).
     let event = watcher.next_event().unwrap().unwrap();
-    assert!(matches!(event, ClipboardEvent::Cleared));
+    assert!(matches!(event, ClipboardEvent::Cleared { .. }));
     drop(event);
 
     // Now copy something; the watcher should see a Changed event.
@@ -205,7 +205,7 @@ fn watch_multiple_changes() {
 
     // Initial state is the empty clipboard.
     let event = watcher.next_event().unwrap().unwrap();
-    assert!(matches!(event, ClipboardEvent::Cleared));
+    assert!(matches!(event, ClipboardEvent::Cleared { .. }));
     drop(event);
 
     // Copy several times in a row, receiving and verifying the contents after each change.
@@ -247,7 +247,7 @@ fn watch_continues_after_clear() {
 
     // Initial empty clipboard.
     let event = watcher.next_event().unwrap().unwrap();
-    assert!(matches!(event, ClipboardEvent::Cleared));
+    assert!(matches!(event, ClipboardEvent::Cleared { .. }));
     drop(event);
 
     // A change followed by a successful receive.
@@ -266,7 +266,7 @@ fn watch_continues_after_clear() {
     )
     .unwrap();
     let event = watcher.next_event().unwrap().unwrap();
-    assert!(matches!(event, ClipboardEvent::Cleared));
+    assert!(matches!(event, ClipboardEvent::Cleared { .. }));
     drop(event);
 
     // A clear in the middle of the stream doesn't stop the watcher: the next change is still
@@ -304,7 +304,7 @@ fn watch_rapid_copies_yield_latest_payload() {
 
     // Initial empty clipboard.
     let event = watcher.next_event().unwrap().unwrap();
-    assert!(matches!(event, ClipboardEvent::Cleared));
+    assert!(matches!(event, ClipboardEvent::Cleared { .. }));
     drop(event);
 
     // Copy several times in a row without draining in between, so the changes queue up.
@@ -362,4 +362,136 @@ fn watch_cancel() {
     cancel_handle.cancel();
 
     handle.join().unwrap().unwrap();
+}
+
+#[test]
+fn watch_both_reports_each_clipboard() {
+    let server = TestServer::new();
+    server
+        .display
+        .handle()
+        .create_global::<State, ZwlrDataControlManagerV1, ()>(2, ());
+
+    let state = State {
+        seats: HashMap::from([(
+            "seat0".into(),
+            SeatInfo {
+                offer: Some(OfferInfo::Buffered {
+                    data: vec![("text/plain".into(), b"regular".to_vec())],
+                }),
+                primary_offer: Some(OfferInfo::Buffered {
+                    data: vec![("text/html".into(), b"primary".to_vec())],
+                }),
+            },
+        )]),
+        ..Default::default()
+    };
+    state.create_seats(&server);
+
+    let socket_name = server.socket_name().to_owned();
+    server.run(state);
+
+    let mut watcher =
+        Watcher::with_socket(ClipboardType::Both, Seat::Unspecified, Some(socket_name)).unwrap();
+
+    let event = watcher.next_event().unwrap().unwrap();
+    assert!(matches!(
+        &event,
+        ClipboardEvent::Changed { clipboard: crate::paste::ClipboardType::Regular, mime_types, .. }
+            if *mime_types == ["text/plain"]
+    ));
+    drop(event);
+
+    let event = watcher.next_event().unwrap().unwrap();
+    assert!(matches!(
+        event,
+        ClipboardEvent::Changed { clipboard: crate::paste::ClipboardType::Primary, mime_types, .. }
+            if mime_types == ["text/html"]
+    ));
+}
+
+#[test]
+fn watch_primary_skips_regular_events() {
+    let server = TestServer::new();
+    server
+        .display
+        .handle()
+        .create_global::<State, ZwlrDataControlManagerV1, ()>(2, ());
+
+    let state = State {
+        seats: HashMap::from([("seat0".into(), SeatInfo::default())]),
+        ..Default::default()
+    };
+    state.create_seats(&server);
+
+    let socket_name = server.socket_name().to_owned();
+    server.run(state);
+
+    let mut watcher = Watcher::with_socket(
+        ClipboardType::Primary,
+        Seat::Unspecified,
+        Some(socket_name.clone()),
+    )
+    .unwrap();
+
+    let event = watcher.next_event().unwrap().unwrap();
+    assert!(matches!(
+        event,
+        ClipboardEvent::Cleared {
+            clipboard: crate::paste::ClipboardType::Primary
+        }
+    ));
+    drop(event);
+
+    // A regular clipboard change must be skipped; only the primary one should be reported.
+    copy_text(&socket_name, b"regular");
+    let mut opts = Options::new();
+    opts.clipboard(copy::ClipboardType::Primary);
+    copy::copy_internal(
+        opts,
+        vec![MimeSource {
+            source: Source::Bytes(b"primary"[..].into()),
+            mime_type: copy::MimeType::Specific("text/plain".into()),
+        }],
+        Some(socket_name),
+    )
+    .unwrap();
+
+    let ClipboardEvent::Changed {
+        clipboard,
+        mut offer,
+        ..
+    } = watcher.next_event().unwrap().unwrap()
+    else {
+        panic!("expected ClipboardEvent::Changed");
+    };
+    assert_eq!(clipboard, crate::paste::ClipboardType::Primary);
+    assert_eq!(receive_text(&mut offer), b"primary");
+}
+
+#[test]
+fn watch_both_requires_primary() {
+    let server = TestServer::new();
+    server
+        .display
+        .handle()
+        .create_global::<State, ZwlrDataControlManagerV1, ()>(1, ());
+
+    let state = State {
+        seats: HashMap::from([("seat0".into(), SeatInfo::default())]),
+        ..Default::default()
+    };
+    state.create_seats(&server);
+
+    let socket_name = server.socket_name().to_owned();
+    server.run(state);
+
+    let result = Watcher::with_socket(ClipboardType::Both, Seat::Unspecified, Some(socket_name));
+    assert!(matches!(
+        result,
+        Err(Error::MissingProtocol {
+            name: "ext-data-control, or wlr-data-control",
+            version: 2
+        })
+    ));
 }

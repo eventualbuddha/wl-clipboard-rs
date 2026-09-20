@@ -112,15 +112,16 @@ fn watch(
     mime_type_selector: MimeType<'_>,
     cmd: &[String],
 ) -> Result<(), anyhow::Error> {
-    let mut watcher = Watcher::new(clipboard, seat)?;
+    let mut watcher = Watcher::new(clipboard.into(), seat)?;
     while let Some(event) = watcher.next_event()? {
         match event {
-            ClipboardEvent::Cleared => {
+            ClipboardEvent::Cleared { .. } => {
                 run_watch_cmd(cmd, Stdio::null(), CLIPBOARD_STATE_NIL);
             }
             ClipboardEvent::Changed {
                 mime_types,
                 mut offer,
+                ..
             } => {
                 let clipboard_state = if mime_types
                     .iter()

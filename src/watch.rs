@@ -16,7 +16,7 @@ use wayland_client::{delegate_dispatch, event_created_child, Dispatch, EventQueu
 
 use crate::common::{self, initialize};
 use crate::data_control::{self, impl_dispatch_device, impl_dispatch_manager, impl_dispatch_offer};
-use crate::paste::{ClipboardType, Error, Seat};
+use crate::paste::{self, Error, Seat};
 
 struct State {
     common: common::State,
@@ -30,12 +30,12 @@ impl State {
     fn got_primary_selection(&self) -> bool {
         self.selection_events
             .iter()
-            .any(|event| event.clipboard == ClipboardType::Primary)
+            .any(|event| event.clipboard == paste::ClipboardType::Primary)
     }
 
     fn push_selection_event(
         &mut self,
-        clipboard: ClipboardType,
+        clipboard: paste::ClipboardType,
         seat: &WlSeat,
         offer: Option<data_control::Offer>,
     ) {
@@ -57,7 +57,7 @@ impl State {
 
 /// Pending selection event to report from the watch loop.
 struct SelectionEvent {
-    clipboard: ClipboardType,
+    clipboard: paste::ClipboardType,
     seat: WlSeat,
     offer: Option<SelectionOffer>,
 }
@@ -106,7 +106,7 @@ impl_dispatch_device!(State, WlSeat, |state: &mut Self, event, seat: &WlSeat| {
         }
         Event::Selection { id } => {
             state.push_selection_event(
-                ClipboardType::Regular,
+                paste::ClipboardType::Regular,
                 seat,
                 id.map(data_control::Offer::from),
             );
@@ -118,7 +118,7 @@ impl_dispatch_device!(State, WlSeat, |state: &mut Self, event, seat: &WlSeat| {
         }
         Event::PrimarySelection { id } => {
             state.push_selection_event(
-                ClipboardType::Primary,
+                paste::ClipboardType::Primary,
                 seat,
                 id.map(data_control::Offer::from),
             );
@@ -150,15 +150,57 @@ impl CancelHandle {
     }
 }
 
+/// The clipboard to watch.
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Hash, PartialOrd, Ord, Default)]
+pub enum ClipboardType {
+    /// The regular clipboard.
+    #[default]
+    Regular,
+    /// The "primary" clipboard.
+    ///
+    /// Watching the "primary" clipboard requires the compositor to support ext-data-control,
+    /// or wlr-data-control version 2 or above.
+    Primary,
+    /// Watch both clipboards at once.
+    ///
+    /// Each [`ClipboardEvent`] reports which clipboard it came from. This option requires the
+    /// "primary" clipboard to be supported.
+    Both,
+}
+
+impl ClipboardType {
+    fn includes(self, clipboard: paste::ClipboardType) -> bool {
+        match self {
+            ClipboardType::Regular => clipboard == paste::ClipboardType::Regular,
+            ClipboardType::Primary => clipboard == paste::ClipboardType::Primary,
+            ClipboardType::Both => true,
+        }
+    }
+}
+
+impl From<paste::ClipboardType> for ClipboardType {
+    fn from(clipboard: paste::ClipboardType) -> Self {
+        match clipboard {
+            paste::ClipboardType::Regular => ClipboardType::Regular,
+            paste::ClipboardType::Primary => ClipboardType::Primary,
+        }
+    }
+}
+
 /// A clipboard selection event reported by [`Watcher::next_event`].
 pub enum ClipboardEvent<'a> {
     /// The selection changed; `mime_types` lists offered types in protocol order.
     Changed {
+        /// The clipboard whose selection changed.
+        clipboard: paste::ClipboardType,
         mime_types: Vec<String>,
         offer: Offer<'a>,
     },
     /// The selection was cleared.
-    Cleared,
+    Cleared {
+        /// The clipboard that was cleared.
+        clipboard: paste::ClipboardType,
+    },
 }
 
 /// Watches the clipboard for selection changes.
@@ -196,7 +238,7 @@ impl Watcher {
         seat: Seat<'_>,
         socket_name: Option<OsString>,
     ) -> Result<Self, Error> {
-        let (mut queue, mut common) = initialize(clipboard == ClipboardType::Primary, socket_name)?;
+        let (mut queue, mut common) = initialize(clipboard != ClipboardType::Regular, socket_name)?;
 
         if common.seats.is_empty() {
             return Err(Error::NoSeats);
@@ -220,7 +262,7 @@ impl Watcher {
             .roundtrip(&mut state)
             .map_err(Error::WaylandCommunication)?;
 
-        if clipboard == ClipboardType::Primary && !state.got_primary_selection() {
+        if clipboard != ClipboardType::Regular && !state.got_primary_selection() {
             return Err(Error::PrimarySelectionUnsupported);
         }
 
@@ -274,7 +316,7 @@ impl Watcher {
     // at the front of the queue.
     fn front_matches(&mut self) -> bool {
         while let Some(event) = self.state.selection_events.front() {
-            if event.clipboard == self.clipboard && event.seat == self.watched {
+            if self.clipboard.includes(event.clipboard) && event.seat == self.watched {
                 return true;
             }
             self.state.selection_events.pop_front();
@@ -285,16 +327,19 @@ impl Watcher {
     // Removes the front event, returning its kind and an [`Offer`] to receive from. Only call when
     // `front_matches` returned `true`.
     fn take_front_event<'a>(&'a mut self) -> ClipboardEvent<'a> {
-        let event = self.state.selection_events.pop_front().unwrap();
-        match event.offer {
+        let SelectionEvent {
+            clipboard, offer, ..
+        } = self.state.selection_events.pop_front().unwrap();
+        match offer {
             Some(SelectionOffer { offer, mime_types }) => ClipboardEvent::Changed {
+                clipboard,
                 mime_types,
                 offer: Offer {
                     watcher: self,
                     offer,
                 },
             },
-            None => ClipboardEvent::Cleared,
+            None => ClipboardEvent::Cleared { clipboard },
         }
     }
 

@@ -12,8 +12,8 @@ use std::error::Error;
 use std::io::{self, BufRead, Read};
 use std::thread;
 
-use wl_clipboard_rs::paste::{ClipboardType, Seat};
-use wl_clipboard_rs::watch::{ClipboardEvent, Watcher};
+use wl_clipboard_rs::paste::Seat;
+use wl_clipboard_rs::watch::{ClipboardEvent, ClipboardType, Watcher};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut watcher = Watcher::new(ClipboardType::Regular, Seat::Unspecified)?;
@@ -34,6 +34,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             ClipboardEvent::Changed {
                 mime_types,
                 mut offer,
+                ..
             } => {
                 println!("changed: {} mime type(s) offered", mime_types.len());
                 for mime_type in mime_types {
@@ -53,7 +54,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
             }
-            ClipboardEvent::Cleared => println!("cleared"),
+            ClipboardEvent::Cleared { .. } => println!("cleared"),
         }
     }
 
