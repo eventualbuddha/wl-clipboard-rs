@@ -116,7 +116,7 @@ fn watch(
     while let Some(event) = watcher.next_event()? {
         match event {
             ClipboardEvent::Cleared { .. } => {
-                run_watch_cmd(cmd, Stdio::null(), CLIPBOARD_STATE_NIL);
+                run_watch_cmd(cmd, Stdio::null(), CLIPBOARD_STATE_NIL, None);
             }
             ClipboardEvent::Changed {
                 mime_types,
@@ -137,7 +137,9 @@ fn watch(
                 };
 
                 match offer.receive(&selected) {
-                    Ok(pipe) => run_watch_cmd(cmd, Stdio::from(pipe), clipboard_state),
+                    Ok(pipe) => {
+                        run_watch_cmd(cmd, Stdio::from(pipe), clipboard_state, Some(&selected))
+                    }
                     Err(e) => eprintln!("wl-paste: failed to receive clipboard contents: {e}"),
                 }
             }
@@ -146,13 +148,23 @@ fn watch(
     Ok(())
 }
 
-fn run_watch_cmd(cmd: &[String], stdin: Stdio, clipboard_state: &str) {
-    match Command::new(&cmd[0])
+fn run_watch_cmd(
+    cmd: &[String],
+    stdin: Stdio,
+    clipboard_state: &str,
+    clipboard_type: Option<&str>,
+) {
+    let mut command = Command::new(&cmd[0]);
+    command
         .args(&cmd[1..])
         .stdin(stdin)
-        .env("CLIPBOARD_STATE", clipboard_state)
-        .spawn()
-    {
+        .env("CLIPBOARD_STATE", clipboard_state);
+    match clipboard_type {
+        Some(mime_type) => command.env("CLIPBOARD_TYPE", mime_type),
+        None => command.env_remove("CLIPBOARD_TYPE"),
+    };
+
+    match command.spawn() {
         Ok(mut child) => {
             let _ = child.wait();
         }

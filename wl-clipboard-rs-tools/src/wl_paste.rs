@@ -53,6 +53,8 @@ pub struct Options {
     /// COMMAND and its arguments must follow all other wl-paste options.
     /// The command is invoked with the new clipboard contents on stdin.
     /// CLIPBOARD_STATE env is set to "data", "sensitive", or "nil" (cleared).
+    /// CLIPBOARD_TYPE env is set to the MIME type of the data on stdin, and is
+    /// unset when the clipboard is cleared.
     #[arg(long, short = 'w', conflicts_with = "list_types")]
     pub watch: bool,
 
